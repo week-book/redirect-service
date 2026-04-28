@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    uses: week-book/github-actions/.github/workflows/docker-build-push.yml@main
+    with:
+      image: ghcr.io/week-book/redirect-service
+    secrets: inherit
+
+  deploy:
+    needs: build
+    uses: week-book/github-actions/.github/workflows/update-kustomize.yml@main
+    with:
+      manifests_repo: week-book/k8s-manifests
+      manifests_path: web-site/redirect
+      image_tag: ${{ needs.build.outputs.image_tag }}
+      service_name: redirect-service
+    secrets:
+      K8S_REPO_TOKEN: ${{ secrets.K8S_REPO_TOKEN }}
