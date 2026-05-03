@@ -83,9 +83,9 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// background refresh every 5 min
+	// background refresh every 30 second
 	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
+		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 
 		for range ticker.C {
