@@ -3,9 +3,14 @@
 // Redirect service for p.week-book.ru
 //
 // Example:
-//   https://p.week-book.ru/b1wRAR
-// redirects to:
+//   https://go.week-book.ru/b1wRAR
+// redirects (302) to:
 //   https://week-book.ru/posts/indie-web
+//
+// Post data is fetched live from posts-api on every request
+// (GET {API_BASE_URL}/posts/by-short-id/{short_id}), which is an
+// authenticated endpoint — requests carry Authorization: Bearer <API_KEY>.
+// There is no local cache/store and no more polling of index.json.
 //
 // Run:
 //   go mod init redirect-service
@@ -14,7 +19,8 @@
 //
 // Env:
 //   PORT=8080
-//   JSON_URL=https://s3.week-book.ru/posts/index.json
+//   API_BASE_URL=https://api.week-book.ru
+//   API_KEY=<posts-api key issued to this consumer>
 //   TARGET_BASE=https://week-book.ru/posts
 //
 // Recommended deploy behind nginx/caddy.
@@ -25,162 +31,104 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"html"
 	"log"
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 )
 
-type PostMeta struct {
-	Title   string `json:"title"`
-	Excerpt string `json:"excerpt"`
-}
-
+// Post mirrors the subset of the posts-api response this service needs.
 type Post struct {
-	ShortID  string   `json:"short_id"`
-	Slug     string   `json:"slug"`
-	Filename string   `json:"filename"`
-	Meta     PostMeta `json:"meta"`
+	Slug string `json:"slug"`
 }
 
-type Store struct {
-	mu   sync.RWMutex
-	data map[string]Post
+var errNotFound = errors.New("post not found")
+
+type apiClient struct {
+	baseURL string
+	apiKey  string
+	http    *http.Client
 }
 
-func NewStore() *Store {
-	return &Store{data: make(map[string]Post)}
+func newAPIClient(baseURL, apiKey string) *apiClient {
+	return &apiClient{
+		baseURL: strings.TrimRight(baseURL, "/"),
+		apiKey:  apiKey,
+		http:    &http.Client{Timeout: 5 * time.Second},
+	}
 }
 
-func (s *Store) SetAll(items map[string]Post) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.data = items
-}
+func (c *apiClient) getBySlugShortID(ctx context.Context, shortID string) (Post, error) {
+	url := c.baseURL + "/posts/by-short-id/" + shortID
 
-func (s *Store) Get(shortID string) (Post, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	p, ok := s.data[shortID]
-	return p, ok
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return Post{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return Post{}, err
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var post Post
+		if err := json.NewDecoder(resp.Body).Decode(&post); err != nil {
+			return Post{}, err
+		}
+		return post, nil
+	case http.StatusNotFound:
+		return Post{}, errNotFound
+	default:
+		return Post{}, errors.New("posts-api bad status: " + resp.Status)
+	}
 }
 
 func main() {
 	port := getEnv("PORT", "8080")
-	jsonURL := getEnv("JSON_URL", "https://s3.week-book.ru/posts/index.json")
+	apiBaseURL := getEnv("API_BASE_URL", "https://api.week-book.ru")
+	apiKey := os.Getenv("API_KEY")
 	targetBase := getEnv("TARGET_BASE", "https://week-book.ru/posts")
 
-	store := NewStore()
-
-	// initial load
-	if err := refresh(store, jsonURL); err != nil {
-		log.Fatal(err)
+	if apiKey == "" {
+		log.Fatal("API_KEY is required")
 	}
 
-	// background refresh every 30 second
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			if err := refresh(store, jsonURL); err != nil {
-				log.Println("refresh error:", err)
-			}
-		}
-	}()
+	client := newAPIClient(apiBaseURL, apiKey)
 
 	r := chi.NewRouter()
 
-	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
 
 	r.Get("/{shortID}", func(w http.ResponseWriter, r *http.Request) {
 		shortID := chi.URLParam(r, "shortID")
-		post, ok := store.Get(shortID)
-		if !ok {
-			http.NotFound(w, r)
+
+		post, err := client.getBySlugShortID(r.Context(), shortID)
+		if err != nil {
+			if errors.Is(err, errNotFound) {
+				http.NotFound(w, r)
+				return
+			}
+			log.Println("posts-api error:", err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
 			return
 		}
 
 		target := strings.TrimRight(targetBase, "/") + "/" + post.Slug
-
-		title := html.EscapeString(post.Meta.Title)
-		desc := html.EscapeString(post.Meta.Excerpt)
-		url := html.EscapeString(target)
-
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprintf(w, `<!DOCTYPE html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8">
-  <title>%s</title>
-  <meta name="description" content="%s">
-  <meta property="og:title" content="%s — Week-book">
-  <meta property="og:description" content="%s">
-  <meta property="og:url" content="%s">
-  <meta property="og:type" content="article">
-  <meta http-equiv="refresh" content="0; url=%s">
-  <link rel="canonical" href="%s">
-</head>
-<body>
-  <p>Перенаправление… <a href="%s">%s</a></p>
-</body>
-</html>`, title, desc, title, desc, url, url, url, url, title)
+		http.Redirect(w, r, target, http.StatusFound)
 	})
+
 	log.Println("server started on :" + port)
 	log.Fatal(http.ListenAndServe(":"+port, r))
-}
-
-func refresh(store *Store, url string) error {
-	posts, err := fetchPosts(url)
-	if err != nil {
-		return err
-	}
-	tmp := make(map[string]Post, len(posts))
-	for _, p := range posts {
-		if p.ShortID == "" || p.Slug == "" {
-			continue
-		}
-		tmp[p.ShortID] = p
-	}
-	store.SetAll(tmp)
-	log.Println("loaded redirects:", len(tmp))
-	return nil
-}
-
-func fetchPosts(url string) ([]Post, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, errors.New("bad status: " + resp.Status)
-	}
-
-	var posts []Post
-	if err := json.NewDecoder(resp.Body).Decode(&posts); err != nil {
-		return nil, err
-	}
-
-	return posts, nil
 }
 
 func getEnv(key, fallback string) string {
